@@ -198,46 +198,217 @@ Ordinary nextest runs skip ignored contracts; use the `ci` or `contracts` suite 
 
 ## Release validation
 
-Run against the release candidate on each supported host. Child stdout and stderr are streamed live to the matching terminal streams and retained together in each command's log. Reports, logs, OS information, and the commit id are saved under `~/.local/share/testd/release-checks/` (`%LOCALAPPDATA%/testd/release-checks/` on Windows). Use Python 3.12 or newer; on Windows replace `python3` with `python` or `py -3`.
+This is the runbook for checks **outside hosted CI**: actual OS resolver/trust changes, service supervision, real browsers, interactive desktop/login behavior, and installation/uninstall. Use individual suites on separately restored VMs, not one unattended `all --system --interactive` run. Incomplete artifact or system cleanup can block later stages of `all`.
+
+### What can currently run
+
+| Check | Linux desktop VM | macOS VM | Windows 11 VM |
+|---|---|---|---|
+| Resolver/trust installation and owned cleanup | `host --system`; shared trust effects still require independent comparison | Blocked by ownership safeguards | Blocked by ownership safeguards |
+| Actual service supervision | `service` with a real systemd user session | Launchd check blocked by ownership safeguards | Not applicable: no CLI service shipped |
+| Real browser | Fixture-owned setup with `browser --system` | Preconfigured mode only; separately proven DNS/trust setup required | Preconfigured mode only; separately proven DNS/trust setup required |
+| Tray, setup, login, GUI workflow | `desktop`, plus separate logout/login evidence | Desktop runner blocked | Desktop runner blocked |
+| Archive/package smoke | `artifacts`; real uninstall remains incomplete | `artifacts`; not complete installed-app evidence | `artifacts`; not complete installed-app evidence |
+| Full installation/upgrade/uninstall | Manual checklist with owned integration and full-system comparison | Resolver/trust cleanup coverage blocked | Resolver/trust cleanup coverage blocked |
+| Signing/notarization | Record packages as unsigned | Separate credentialed signing and verification | Separate credentialed signing and verification |
+
+A VM does not bypass a blocked runner. Do not remove its guards, force system checks through direct scripts, or mark blocked platform coverage passed. macOS 15 or another explicitly claimed supported macOS version can be tested; upgrading the host to Tahoe is not a requirement of this runbook.
+
+### Prepare and save the VM baseline
+
+1. Create a disposable VM with a real desktop and a fresh local test user. Use native Ubuntu 24.04 and Fedora 44 Workstation VMs for claimed Linux coverage, the claimed macOS versions/architectures on Apple hardware, and Windows 11 for desktop Windows evidence. Containers, WSL, and Windows Server do not substitute for these OS checks.
+2. Before changing the guest, persist a complete restorable backup of its disks and VM configuration outside the guest and outside temporary storage. Check that your VM manager can restore it. Do not rely solely on an in-guest snapshot or `system-before/` report.
+3. Install Python 3.12 or newer, Git, and the suite-specific tools below. Install Bun for browser fixtures and the selected real browsers with clean profiles and no accounts. Install native GUI runtime dependencies for the candidate package; source builds additionally need the [build prerequisites](#prerequisites). Use only synthetic projects and credentials.
+4. Copy the exact candidate assets and a checkout of their source revision into the VM. Record the run URL, source SHA, OS image/version/architecture, tool/browser versions, and artifact SHA-256 digests. Do not execute candidate binaries on your everyday host merely to check their version.
+5. Save a second full-system backup as the **prepared baseline**, still without testd user data, resolver/trust integration, running daemon, or login entry. Preserve installed tools/browsers in this baseline so repeated runs use the same environment.
+6. Before each sensitive suite, restore that prepared baseline, verify the guest is clean, and choose a new persisted report path. Block external network egress for browser tests after installing dependencies; keep loopback working. Disable unnecessary shared host folders and real providers. Use a dedicated private evidence-transfer location only.
+7. After each suite, stop candidate apps, daemons, browser fixtures, and providers. Retain the report and before/after evidence outside the VM before restoring it. Restore the baseline before the next suite, browser, package, upgrade, or seeded-conflict case. A report left only on a reverted guest is lost evidence.
+
+On Linux, the resolver and service suites need a running systemd-resolved and systemd user manager. Provision tools **only inside the backed-up disposable guest**:
 
 ```sh
-# Automated code/dependency/MSRV checks; omit --gui if Tauri prerequisites are absent
-python3 tests/release/run.py core --strict --gui
+# Ubuntu 24.04
+sudo apt-get update
+sudo apt-get install -y python3 git curl openssl systemd-resolved ca-certificates libnss3-tools libcap2-bin
 
-# Linux OS integration on a disposable VM with a persisted full-system snapshot
-sudo -v
-python3 tests/release/run.py host --system --bin /path/to/candidate-testd \
-  --report ~/testd-reports/linux-system-01
-
-# Candidate archives and checksums on a separately backed-up disposable VM
-python3 tests/release/run.py artifacts --artifacts ~/Downloads/testd-candidate --require-checksums \
-  --report ~/testd-reports/artifacts-01
-# Optional upgrade check: add --previous-bin /path/to/previous/testd
-
-# Real browsers on a separately prepared disposable VM and fresh user
-python3 tests/release/run.py browser --bin /path/to/candidate-testd --report ~/testd-reports/browser-01
-
-# Linux desktop on a separately prepared disposable VM and fresh user
-python3 tests/release/run.py desktop --app /path/to/candidate-app --bin /path/to/candidate-testd \
-  --report ~/testd-reports/desktop-01
+# Fedora 44: use this instead of the Ubuntu commands
+sudo dnf install -y python3 git curl openssl systemd-resolved ca-certificates nss-tools libcap
 ```
 
-The `core` release suite runs ignored Rust contracts as well as ordinary tests; known failing contracts therefore block it until they are resolved or the relevant feature is explicitly excluded. See [tests/README.md](tests/README.md) for the current gaps.
+From a terminal in the guest's logged-in desktop session, check the prerequisites without changing them:
 
-Reports contain local PKI and test credentials and are private by default. Do not attach the entire report directory to a public issue; share only reviewed logs/JSON, never private keys or credentials.
+```sh
+python3 --version
+systemctl is-active systemd-resolved
+resolvectl status
+systemctl --user show-environment
+```
 
-The browser suite uses Bun fixtures and publishes `app.releasecheck`, `api.releasecheck`, and a dead-upstream name. It checks HTTPS, WebSocket idle survival, streamed SSE, a 100 MiB upload, and project-cookie scope. It refuses an occupied intake port, starts and stops its own candidate daemon, and disables real tunnel providers. Initialize the fresh test user and prepare OS DNS and trust on a separately backed-up disposable VM. `testd doctor --json` checks resolver readiness before the browser opens. Run the page in each supported browser, complete the certificate and error-response observations, and save the JSON report. Ctrl+C stops the fixture processes. For a high edge port, pass `--edge-port 8443`. The suite does not itself install trust or change the resolver.
+If the resolver or user manager is unavailable, prepare a supported clean guest first. On Fedora, record `getenforce` and retain SELinux enforcement; do not switch to permissive to obtain a pass. Do not stop unrelated listeners or overwrite conflicting DNS configuration to obtain a pass. Run suite commands directly in an interactive terminal as the test user, not under `sudo python`, through a pipe, or with redirected stdin. Cache sudo only where shown below. On Windows use `python` or `py -3` instead of `python3`.
 
-The `service` suite (also available as `host --service` or `artifacts --service`) requires the disposable-host confirmation and a persisted report. Run it separately from `--system` on a restored snapshot. On Linux it exercises the real systemd user-session supervisor with a randomly named unit, isolated home, fake provider, high ports, and manager-directed crash and stop. It creates the unit exclusively, removes it only if its recorded identity and bytes still match, and retains the generated unit in the report. Launchd checks remain blocked until service ownership can be established; Windows does not ship a CLI service.
+### Prepare the candidate and per-run paths
 
-The desktop suite records each GUI checklist item as pass, fail, or not applicable with evidence. It requires a real interactive terminal and desktop session, a fresh user, a candidate app and CLI, and confirmation of a disposable host with a persisted full-system snapshot. Linux cleanup invokes the candidate's ownership-checked uninstall only after the operator confirms all candidate processes have stopped. macOS and Windows desktop checks remain blocked until resolver and trust ownership can be established. A scoped snapshot does not cover installer, login, browser, or shared CA-store effects. Unconfirmed shutdown defers cleanup. Skips and unanswered checks remain visible in `report.json`; they are not counted as passes.
+Download only the matching `bundles-TARGET` artifact from the successful manual CI run. Targets are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`. Keep each target's files in its own candidate directory. Manual builds do not provide the release job's `SHA256SUMS`; generate a local manifest from the downloaded bytes before transferring them:
 
-`host --system` requires a clean disposable host, no testd daemon, an interactive confirmation, a new persisted report, and a persisted full-system snapshot. Linux uses the candidate's ownership-checked uninstall after verifying fixture shutdown; changed or unowned state is left untouched. The scoped verification does not establish that shared trust-store output or hooks are unchanged, so the system stage remains incomplete until independently reviewed against the full-system snapshot. macOS and Windows product system checks are blocked. Plain `host` does not change system integration. `--bin /path/to/testd` runs a candidate CLI without rebuilding it.
+```sh
+python3 scripts/release.py checksums /absolute/path/to/new-candidate-directory
+```
+
+This manifest detects later changes; it is not a published release checksum, signature, or proof of source provenance. Preserve it with the run metadata. Do not regenerate an existing manifest to conceal changed files. For published releases, use their original manifest instead.
+
+Inside the VM, extract the CLI archive into a dedicated candidate directory. Set `CLI` to that executable and, for desktop testing, `APP` to the actual executable from the selected package or verified source build. The app and CLI must match the intended source revision. These POSIX-shell variables are recreated after each baseline restore:
+
+```sh
+CLI='/absolute/path/to/candidate/testd'
+APP='/absolute/path/to/candidate/testd-gui'
+ASSETS='/absolute/path/to/candidate-assets'
+REPORT="$HOME/testd-reports/$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Replace the paths before use. GitHub artifact downloads do not preserve Unix executable permissions: inside the backed-up Linux guest, use `chmod u+x /absolute/path/to/candidate.AppImage` before its runtime smoke check if needed. Preserve the downloaded original; record permission changes separately from content hashes. The runner creates the report directory; do not create it yourself or reuse a previous path. For multiple commands on the same restored guest, choose distinct report suffixes. Candidate hashes, command output, OS metadata, and source revision are retained by the runner.
+
+### Run Linux resolver and trust checks
+
+Restore the prepared baseline, set the candidate/report variables, then run:
+
+```sh
+sudo -v
+python3 tests/release/run.py host --system --bin "$CLI" --report "$REPORT-system"
+```
+
+Do not run `testd init` first. This suite creates an isolated fixture home, installs its test-only route and public root, tests OS resolution and trusted HTTPS, stops its fixture, and invokes ownership-checked cleanup. It refuses existing testd integration. It can change the systemd-resolved drop-in, the distro CA anchor, and generated shared trust-store output/hooks.
+
+Inspect `report.json`, command logs, and `system-before/`. Independently compare resolver state, source anchors, effective trust, generated bundles, and hook effects with the persisted full-system baseline. Scoped cleanup alone leaves this stage incomplete. Record the comparison result separately; neither restoring the VM nor editing report JSON converts missing preservation evidence into a pass.
+
+Complete [SYS-01 through SYS-16](tests/manual/system-integration.md), including interruption/recovery and synthetic unowned/conflicting-state cases. Each seeded conflict needs its own restored snapshot and before/after identity/content evidence; do not ask `host --system` to overwrite it. SYS-15 and SYS-16 remain blocked until macOS/Windows ownership safeguards exist.
+
+### Run Linux service supervision
+
+Restore the prepared baseline and run from the test user's real desktop session:
+
+```sh
+systemctl --user show-environment
+python3 tests/release/run.py service --bin "$CLI" --report "$REPORT-service"
+```
+
+Do not add `--system` or run this as root. The suite uses a randomly named user unit, isolated home, fake provider, high ports, and actual manager-directed start, crash/restart, and stop. Verify the stopped listener and ownership-checked unit cleanup in the report; `service-unit.service` retains the generated unit. Keep macOS launchd marked blocked and Windows CLI service marked not applicable.
+
+### Run real Linux browsers
+
+Before saving the prepared baseline, install Playwright where Bun can resolve it from the checkout, and install the engines you intend to test. Do not add a project dependency or modify tracked manifests just for a VM run:
+
+```sh
+bun install --frozen-lockfile
+bun add --no-save playwright
+bunx playwright --version
+# Ubuntu: installs browser dependencies as well as the selected engines
+bunx playwright install --with-deps chromium firefox webkit
+```
+
+On Fedora, use `bunx playwright install chromium firefox webkit` and supply the engine's Fedora runtime dependencies separately; do not force Ubuntu's dependency installer onto Fedora. Unsupported or missing engines remain blocked. Linux Chromium/Firefox require NSS `certutil`, provided by the packages above. Record Playwright/browser versions and retain them in the prepared baseline.
+
+For an automatic real-engine run, restore the baseline, block guest external egress, then run:
+
+```sh
+sudo -v
+python3 tests/release/run.py browser --system --bin "$CLI" --browser-engine chromium \
+  --edge-port 8443 --report "$REPORT-chromium"
+```
+
+Repeat from separately restored baselines for `firefox` and `webkit`. No prior `testd init` or daemon is required: `--system` creates the fixture home, configures its candidate resolver/root, starts its own host, drives the browser, checks OS TLS before/after a renewed leaf, and performs scoped cleanup. Shared trust effects still require the independent comparison described above. Playwright WebKit is not installed Safari evidence; Chromium is not installed Chrome or Edge evidence.
+
+For the actual installed Chrome, Firefox, or Edge and their certificate viewers, run a separate manual browser session:
+
+```sh
+sudo -v
+python3 tests/release/run.py browser --system --bin "$CLI" --edge-port 8443 --report "$REPORT-browser-manual"
+```
+
+Open the printed `https://app.releasecheck.test:8443/` URL in a clean profile. If that browser uses its own trust store, import only the fixture's public root from `<report>/browser-home/.config/testd/pki/root.crt` into that disposable profile. Do not use certificate-warning bypasses, `--insecure`, browser-only DNS overrides, or a real account. Complete [BROWSER-01 through BROWSER-08](tests/manual/browser.md): certificate/SAN/chain/lifetime, WebSocket idle, SSE/upload, cookie scope, dashboard/dead upstream/unknown name, and renewal. Save the page's JSON report, stop with Ctrl+C, close the test browsers, and answer shutdown confirmations truthfully.
+
+On macOS/Windows, `browser` without `--system` supports a separately preconfigured candidate DNS/trust setup, but does not establish that setup's ownership or cleanup. The host must be stopped before running the suite; it starts its own candidate daemon. Do not improvise a fresh-VM root/NRPT/resolver installation to bypass the current platform blockers. Record Safari/Windows browser coverage as blocked until a separately proven, restorable setup is available.
+
+### Run Linux desktop, login, and installed-package checks
+
+Restore the baseline and install the actual selected `.deb` or prepare the verified AppImage/source-build executable and required GUI runtime libraries. Do not launch or initialize testd before the desktop runner: the test user must still have no testd configuration. On Ubuntu, install the verified package and inspect its paths:
+
+```sh
+DEB='/absolute/path/to/candidate.deb'
+sudo apt-get install "$DEB"
+dpkg-deb --contents "$DEB"
+```
+
+Set `APP` to the installed GUI executable shown by the package, not the `.deb` file. Fedora does not install a Debian package; use its verified AppImage or a native source build and record the actual packaging format tested.
+
+The real GUI executable must be able to bind port 443. On the backed-up guest only, grant the capability to the actual ELF executable if needed and record the change:
+
+```sh
+sudo setcap 'cap_net_bind_service=+ep' "$APP"
+getcap "$APP"
+python3 tests/release/run.py desktop --app "$APP" --bin "$CLI" --report "$REPORT-desktop"
+```
+
+Do not grant a capability to an AppImage launcher and assume its extracted child inherits it; identify the actual GUI executable. Do not run the entire desktop as root. The runner launches the app and prompts for [GUI-01 through GUI-28](tests/host/gui-checklist.md). Perform each action before answering `p`, `f`, `n`, or `q`; record evidence/reasons and never include the operator secret. Only confirm shutdown after all app/daemon/provider processes and fixture listeners have stopped. Deferred cleanup requires full-system recovery.
+
+GUI-24 needs a **separate logout/login run**: retain evidence outside the guest, enable the candidate's login item, log out/in, and verify one actual tray starts with the expected state. Record the login artifact and process observations; an existing plist/desktop/registry entry alone is not proof. Do not expect an interactive runner session to survive logout.
+
+For archive smoke on each supported OS/architecture, on a separately restored VM:
+
+```sh
+python3 tests/release/run.py artifacts --artifacts "$ASSETS" --require-checksums --report "$REPORT-artifacts"
+```
+
+Windows equivalent, with a new report path on every attempt:
+
+```powershell
+python tests\release\run.py artifacts --artifacts 'C:\candidate-assets' --require-checksums `
+  --report "${HOME}\testd-reports\artifacts-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))"
+```
+
+Artifact smoke validates checksums, CLI extraction/version/init/re-init, and applicable package metadata/runtime; it deliberately reports real uninstall/purge as blocked. Expected exit `2` is **incomplete**, not a pass for the installed workflow. `--previous-bin /path/to/real-previous-testd` adds CLI configuration/root preservation checks, not actual package upgrade evidence.
+
+Complete [INSTALL-01 through INSTALL-10](tests/manual/installation.md) separately for each claimed package: actual installation and first setup, trusted browser workflow, stopped registration, upgrade from a real prior release, interrupted-upgrade rollback, disabled login item, owned integration removal, package removal, and purge/reinstall. On Linux, stop candidate processes and retain ownership/root evidence before `testd uninstall`; purge only after system cleanup succeeds. Compare unowned and shared state against the full-system baseline. Do not manually remove conflicting state. On macOS/Windows, complete cleanup/trusted first-run evidence remains blocked; archive smoke does not resolve it.
+
+### Verify signing and conditional network claims
+
+Manual CI artifacts are unsigned. Record that fact rather than claiming signing/notarization passed. If signed desktop delivery is claimed, follow [Signing and notarization](#signing-and-notarization) and verify the final signed bytes on the target OS. Do not publish a release merely to test signing.
+
+On macOS, verify the actual signed app and its notarization ticket:
+
+```sh
+codesign --verify --deep --strict --verbose=2 /path/to/Testd.app
+codesign --display --verbose=4 /path/to/Testd.app
+spctl --assess --type execute -vv /path/to/Testd.app
+xcrun stapler validate /path/to/Testd.app
+```
+
+On Windows, inspect the installer and installed executables:
+
+```powershell
+Get-AuthenticodeSignature 'C:\candidate\testd-setup.exe' | Format-List Status,StatusMessage,SignerCertificate
+```
+
+Require the expected signer, not merely any valid or ad-hoc signature. SmartScreen reputation and actual OS prompts need separate observations. Missing signing credentials leave signed-delivery claims unverified, not passed.
+
+If a release claims real-provider sharing or non-loopback network behavior, use the separately authorized two-machine procedure in [network and sharing contracts](tests/manual/network-and-sharing.md). Fake providers do not establish real exposure or crash cleanup; unimplemented network controls remain blocked. Do not enable external exposure or a real provider without explicit approval.
+
+### Retain evidence and recover before repeating
+
+Keep `report.json`, `run.log`, command logs, scoped snapshots, and browser/desktop evidence private. Outside the guest, retain a ledger with one row per SYS/BROWSER/GUI/INSTALL/NET/SHARE check: candidate SHA/digest, OS/browser/package, full-system baseline ID/location, result (`pass`, `fail`, `blocked`, or justified `not applicable`), evidence paths, and independent cleanup comparison. Untested, interrupted, and unanswered checks never become passes.
+
+If interrupted, stop every candidate/fixture process and inspect the retained report. An interactive scoped recovery may be attempted on the same guest:
+
+```sh
+python3 tests/release/run.py --restore-report /path/to/retained-report
+```
+
+This is not a full-system restore. Conflicts stay untouched, and Linux/macOS shared trust effects may still produce exit `2`. Preserve recovery logs and restore the full prepared VM baseline before any further sensitive test. Copy evidence out **before** reverting. A restored guest proves recoverability, not that the candidate's uninstall preserved all unowned state.
 
 ## Contents
 
 - [Quickstart](docs/quickstart.md) for using the installed tool
 - [Test runbook](#test) for repeated CI runs, local reproduction, and reports
+- [Non-CI validation runbook](#release-validation) for backed-up VMs, browsers, services, desktop, and installers
 - [Host testing](#host-testing) for checks that need real machines
 - [Browser validation](#browser-validation) for manual checks in real browsers
 - [Release](#release) for the release checklist and artifacts
@@ -452,9 +623,11 @@ Manual checks that a name works in a real browser. Use a disposable host with a 
 
 ### Preconditions
 
-- `testd init` and `testd host` on the host; `testd doctor` exits `0`.
-- A live registration: `testd run app.example:3000 -- <your dev server>`.
-- The device trusts the root. Either `testd doctor --fix` on that device, import `<pki>/root.crt` into the browser's store, or fetch `http://127.0.0.1:7737/ca.crt` from the host and import it.
+For the fixture-driven browser suite, follow [Run real Linux browsers](#run-real-linux-browsers); do not start a daemon beforehand. The following applies instead to a separately observed installed-app workflow on a backed-up disposable host. macOS/Windows product-managed DNS/trust setup remains blocked.
+
+- Initialize the intended candidate, establish owned Linux DNS/trust integration, and start its host; `testd doctor` must exit `0`
+- Start a synthetic local service and register `testd run app.example:3000 -- <your dev server>`
+- Trust only the candidate's public root using the proven OS setup or a clean disposable browser profile; record its fingerprint and the import method
 
 ### Trust stores
 
